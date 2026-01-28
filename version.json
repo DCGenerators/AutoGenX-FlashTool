@@ -1,0 +1,8 @@
+{
+  "name": "AutoGen X",
+  "version": "3.0.0",
+  "offset": "0x10000",
+  "firmware": "firmware.bin",
+  "erase": false,
+  "baud_try": [921600, 460800, 230400, 115200]
+}
