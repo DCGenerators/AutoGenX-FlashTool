@@ -20,7 +20,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller esptool pyserial
 
-            - name: Build EXE (onefile)
+      - name: Debug list files
+        shell: cmd
+        run: |
+          echo ===== ROOT =====
+          dir
+          echo ===== FILES =====
+          dir firmware.bin
+          dir version.json
+
+      - name: Build EXE (onefile)
         shell: cmd
         run: |
           pyinstaller --noconfirm --onefile --console ^
