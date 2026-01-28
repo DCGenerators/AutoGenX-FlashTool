@@ -20,7 +20,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller esptool pyserial
 
-      - name: Build EXE (onefile)
+            - name: Build EXE (onefile)
+        shell: cmd
         run: |
           pyinstaller --noconfirm --onefile --console ^
             --name AutoGenX_FlashTool ^
