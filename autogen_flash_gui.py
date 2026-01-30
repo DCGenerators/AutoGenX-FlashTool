@@ -3,9 +3,26 @@ import queue
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import traceback
+# PYI_BOOTSTRAP_AUTOGEN_FLASH
+import os, sys, importlib.util
 
-import autogen_flash
+def _import_autogen_flash():
+    try:
+        import autogen_flash  # normal import
+        return autogen_flash
+    except ModuleNotFoundError:
+        # PyInstaller onefile: load bundled autogen_flash.py from _MEIPASS
+        base = getattr(sys, "_MEIPASS", None)
+        if not base:
+            raise
+        path = os.path.join(base, "autogen_flash_pyi.py")
+        spec = importlib.util.spec_from_file_location("autogen_flash", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules["autogen_flash"] = mod
+        return mod
 
+autogen_flash = _import_autogen_flash()
 class App(tk.Tk):
     def __init__(self):
         super().__init__()

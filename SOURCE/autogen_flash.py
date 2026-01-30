@@ -106,16 +106,18 @@ def find_device_port() -> str:
 
 # -------------------- esptool (IN-PROCESS) --------------------
 def run_esptool(args, silent=False) -> int:
-    """
+    \"\"\"
     GUI-safe runner:
-    - Frozen (.app): run bundled 'esptool' binary (prevents relaunching GUI)
-    - Not frozen: run system 'esptool'
-    Always non-interactive (stdin=DEVNULL).
-    """
+    - Frozen (.exe): run bundled esptool.exe from sys._MEIPASS
+    - Not frozen: run 'esptool' from environment
+    \"\"\"
     import subprocess, os, sys
 
+# Windows: prevent popping console windows
+CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
     if is_frozen():
-        esptool_bin = os.path.join(sys._MEIPASS, "esptool")
+        esptool_bin = os.path.join(sys._MEIPASS, "esptool.exe")
         cmd = [esptool_bin] + list(args)
     else:
         cmd = ["esptool"] + list(args)
@@ -130,17 +132,17 @@ def run_esptool(args, silent=False) -> int:
         ).returncode
     except Exception:
         return 2
+
 def probe_esp(port: str) -> bool:
-    """
-    Reliable probe: let esptool tell us if it's an ESP.
-    Works consistently across Windows/macOS and matches your manual tests.
-    """
-    # Use flash-id (best) and fall back to chip-id if needed.
+    \"\"\"
+    Reliable probe: let esptool tell us if it's an ESP device.
+    \"\"\"
     for cmd in (["flash-id"], ["chip-id"]):
         rc = run_esptool(["--chip","auto","--port", port, "--baud","115200"] + cmd, silent=True)
         if rc == 0:
             return True
     return False
+
 
 
 def resolve_firmware_path(cfg, firmware_override=None) -> str:

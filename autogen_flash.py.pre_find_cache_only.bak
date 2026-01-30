@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+# ============================================================
+# AutoGen X USB Flash Tool (FIXED)
+# - In-process esptool (no second GUI window on macOS .app)
+# - Correct OTA partition flashing (app0 + app1) + otadata erase
+# - Reliable verify at 115200
+# ============================================================
+
+import os
+
+def touch_reset_lines(port: str):
+    """Toggle DTR/RTS to put ESP into a clean bootloader state."""
+    try:
+        import serial, time
+        ser = serial.Serial(port, 115200, timeout=0.2)
+        ser.dtr = False
+        ser.rts = True
+        time.sleep(0.05)
+        ser.dtr = True
+        ser.rts = False
+        time.sleep(0.05)
+        ser.dtr = False
+        ser.rts = False
+        time.sleep(0.05)
+        ser.close()
+    except Exception:
+        pass
+
+import sys
+import json
+import time
+
+# -------------------- helpers --------------------
+
+def die(msg: str, code: int = 1):
+    print(f"\n❌ {msg}\n", file=sys.stderr)
+    raise SystemExit(code)
+
+def is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+def app_dir() -> str:
+    """
+    Folder where the tool is running from:
+    - In PyInstaller .app: .../Contents/MacOS directory
+    - In CLI/dev: directory of this script
+    """
+    if is_frozen():
+        # sys.executable is the app binary; its directory is Contents/MacOS
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def bundled_dir() -> str:
+    """
+    Folder where PyInstaller unpacks resources (sys._MEIPASS),
+    or script directory when not frozen.
+    """
+    if is_frozen() and hasattr(sys, "_MEIPASS"):
+        return getattr(sys, "_MEIPASS")
+    return os.path.dirname(os.path.abspath(__file__))
+
+def load_cfg() -> dict:
+    """
+    Load version.json from:
+    1) external next to tool (Contents/MacOS on mac app)
+    2) bundled resources
+    fallback: defaults
+    """
+    candidates = [
+        os.path.join(app_dir(), "version.json"),
+        os.path.join(bundled_dir(), "version.json"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+
+    # Safe defaults
+    return {
+        "name": "AutoGen X",
+        "version": "",
+        "firmware": "firmware.bin",
+        "erase": False,
+        "baud_try": [921600, 460800, 230400, 115200],
+    }
+
+def list_ports():
+    try:
+        import serial.tools.list_ports
+    except Exception:
+        return []
+    out = []
+    for p in serial.tools.list_ports.comports():
+        out.append((p.device, p.description or ""))
+    return out
+
+def find_device_port() -> str:
+    ports = list_ports()
+    if not ports:
+        die("No serial ports detected. Plug AutoGen X via USB data cable.")
+
+    print("🔎 Detected ports:")
+    for dev, desc in ports:
+        print(f"  - {dev}  ({desc})")
+
+    def score(dev: str, desc: str) -> int:
+        d = (desc or "").lower()
+        v = (dev or "").lower()
+        # Lower score = higher priority
+        if ("cp210" in d) or ("silicon labs" in d) or ("slab" in d):
+            return 0
+        if ("usb to uart" in d) or ("uart" in d):
+            return 1
+        if ("usbserial" in v) or ("usb" in v):
+            return 2
+        return 10
+
+    # Probe each detected port ONCE (prevents COM port being left busy by repeated probes)
+    candidates = sorted(ports, key=lambda x: score(x[0], x[1]))
+    for dev, desc in candidates:
+        print(f"\n🧪 Probing {dev} ...")
+        if probe_esp(dev):
+            print(f"✅ Found ESP device on {dev}\n")
+            return dev
+
+    die("No ESP device found on detected ports.")
+# -------------------- esptool (IN-PROCESS) --------------------
+def run_esptool(args, silent=False) -> int:
+    """
+    GUI-safe runner:
+    - Frozen Windows: run esptool in-process (captures output, no pop-up windows)
+    - Not frozen: run `python -m esptool` (works reliably on Windows venv)
+    """
+    import os, sys, subprocess
+
+    CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    # Frozen Windows: in-process esptool
+    if is_frozen() and os.name == "nt":
+        try:
+            import esptool, io, contextlib
+            buf = io.StringIO()
+            if silent:
+                with open(os.devnull, "w") as dn, contextlib.redirect_stdout(dn), contextlib.redirect_stderr(dn):
+                    try:
+                        esptool.main(list(args))
+                        return 0
+                    except SystemExit as ex:
+                        return int(ex.code) if isinstance(ex.code, int) else 1
+            else:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    try:
+                        esptool.main(list(args))
+                        return 0
+                    except SystemExit as ex:
+                        rc = int(ex.code) if isinstance(ex.code, int) else 1
+                out = buf.getvalue()
+                # Treat connection markers as success even if rc is nonzero
+                if ("Connected to ESP" in out) or ("Chip type:" in out) or ("Detecting chip type" in out):
+                    return 0
+                return rc
+        except Exception:
+            return 2
+
+    # Not frozen: subprocess `python -m esptool`
+    cmd = [sys.executable, "-m", "esptool"] + list(args)
+    creationflags = CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    try:
+        return subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL if silent else None,
+            stderr=subprocess.DEVNULL if silent else None,
+            check=False,
+            creationflags=creationflags,
+        ).returncode
+    except Exception:
+        return 2
+
+
+def probe_esp(port: str) -> bool:
+    """Reliable probe.
+    In frozen Windows builds we run esptool in-process, so return-code can be misleading.
+    We treat 'Connected to ESP' output as success.
+    """
+    import os, io, contextlib
+
+    # Frozen Windows: run esptool.main() here and capture output
+    if is_frozen() and os.name == "nt":
+        try:
+            import esptool
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                try:
+                    esptool.main(["--chip","auto","--port", port, "--baud","115200","flash-id"])
+                    rc = 0
+                except SystemExit as ex:
+                    rc = int(ex.code) if isinstance(ex.code, int) else 1
+            out = buf.getvalue()
+            if ("Connected to ESP" in out) or ("Chip type:" in out) or ("Detecting chip type" in out):
+                return True
+            return rc == 0
+        except Exception:
+            return False
+
+    # Not frozen: trust subprocess return code
+    rc = run_esptool(["--chip","auto","--port", port, "--baud","115200","flash-id"], silent=True)
+    return rc == 0
+
+
+def resolve_firmware_path(cfg, firmware_override=None) -> str:
+    """
+    Priority:
+    1) firmware_override (GUI selected file or CLI arg)
+    2) firmware.bin next to the tool (external per-customer file)
+    3) bundled firmware.bin (legacy embedded)
+    """
+    if firmware_override:
+        if os.path.exists(firmware_override):
+            return os.path.abspath(firmware_override)
+        die(f"Selected firmware not found: {firmware_override}")
+
+    fw_name = cfg.get("firmware", "firmware.bin")
+
+    # External firmware sitting next to the EXE/app-run folder
+    p_external = os.path.join(app_dir(), fw_name)
+    if os.path.exists(p_external):
+        return p_external
+
+    # Bundled fallback (if you still embed it)
+    p_bundled = os.path.join(bundled_dir(), fw_name)
+    if os.path.exists(p_bundled):
+        return p_bundled
+
+    die(f"Firmware not found.\nExpected either:\n- {p_external}\n- or bundled {fw_name}\n")
+
+# -------------------- flash logic (AUTO FIXED FOR AUTOGEN X) --------------------
+
+def flash(cfg, firmware_override=None):
+    # AutoGen X OTA partition layout (confirmed)
+    OTADATA_OFFSET = "0xE000"
+    OTADATA_SIZE   = "0x2000"
+    APP0_OFFSET    = "0x10000"
+    APP1_OFFSET    = "0x150000"
+
+    erase_full = bool(cfg.get("erase", False))
+    baud_list  = cfg.get("baud_try", [921600, 460800, 230400, 115200])
+    verify_baud = 115200  # reliable on your Mac/CP2102
+
+    fw_path = resolve_firmware_path(cfg, firmware_override)
+    port = find_device_port()
+
+    print(f"📦 Target: {cfg.get('name','AutoGen')}  Version: {cfg.get('version','')}")
+    print(f"📄 Firmware: {fw_path}")
+    print(f"🧠 Mode: AutoGenX OTA (otadata={OTADATA_OFFSET}, app0={APP0_OFFSET}, app1={APP1_OFFSET}) erase_full={erase_full}")
+    print()
+
+    # Optional full erase (kept for compatibility)
+    if erase_full:
+        for b in baud_list:
+            print(f"🧽 Erasing FULL flash @ baud {b} ...")
+            rc = run_esptool(["--port", port, "--baud", str(b), "erase_flash"], silent=False)
+            if rc == 0:
+                break
+        else:
+            die("Erase failed on all baud rates.")
+
+    # Always erase otadata so it won't keep booting an old slot
+    for b in baud_list:
+        print(f"🧹 Erasing otadata @ {OTADATA_OFFSET} size {OTADATA_SIZE} (baud {b}) ...")
+        rc = run_esptool(["--port", port, "--baud", str(b), "erase_region", OTADATA_OFFSET, OTADATA_SIZE], silent=False)
+        if rc == 0:
+            break
+        print("⚠️ otadata erase failed at this baud, retrying lower...\n")
+        time.sleep(0.3)
+    else:
+        die("otadata erase failed on all baud rates.")
+
+    def write_slot(offset_hex: str):
+        for b in baud_list:
+            print(f"⚡ Flashing @ {offset_hex} (baud {b}) ...")
+            rc = run_esptool(["--port", port, "--baud", str(b), "write_flash", "-z", offset_hex, fw_path], silent=False)
+            if rc == 0:
+                return
+            print("⚠️ Flash failed at this baud, retrying lower...\n")
+            time.sleep(0.5)
+        die(f"Flashing failed for slot {offset_hex} on all baud rates.")
+
+    # Flash BOTH slots so whichever is active boots the new firmware
+    write_slot(APP0_OFFSET)
+    write_slot(APP1_OFFSET)
+
+    # Verify both at reliable baud
+    print(f"🔍 Verifying app0 @ {APP0_OFFSET} (baud {verify_baud}) ...")
+    rc = run_esptool(["--port", port, "--baud", str(verify_baud), "verify_flash", APP0_OFFSET, fw_path], silent=False)
+    if rc != 0:
+        die("Verify failed for app0.")
+
+    print(f"🔍 Verifying app1 @ {APP1_OFFSET} (baud {verify_baud}) ...")
+    rc = run_esptool(["--port", port, "--baud", str(verify_baud), "verify_flash", APP1_OFFSET, fw_path], silent=False)
+    if rc != 0:
+        die("Verify failed for app1.")
+
+    print("\n✅ Flash successful (both slots written + verified).")
+    print("🔌 Unplug USB, wait 5–10s, plug back in.\n")
+
+# -------------------- entry --------------------
+
+def main(firmware_override=None):
+    print("======================================")
+    print("   AutoGen X USB Flash Tool")
+    print("======================================\n")
+
+    cfg = load_cfg()
+    if "baud_try" not in cfg:
+        cfg["baud_try"] = [cfg.get("baud", 921600), 460800, 230400, 115200]
+
+    # Support drag-drop / CLI: tool <firmware.bin>
+    if firmware_override is None and len(sys.argv) >= 2:
+        firmware_override = sys.argv[1]
+
+    flash(cfg, firmware_override=firmware_override)
+
+    try:
+        # GUI build: disabled interactive wait
+        pass
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    main()

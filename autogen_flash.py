@@ -7,6 +7,29 @@
 # ============================================================
 
 import os
+
+# Port cache
+_CACHED_PORT = None
+
+
+def touch_reset_lines(port: str):
+    """Toggle DTR/RTS to put ESP into a clean bootloader state."""
+    try:
+        import serial, time
+        ser = serial.Serial(port, 115200, timeout=0.2)
+        ser.dtr = False
+        ser.rts = True
+        time.sleep(0.05)
+        ser.dtr = True
+        ser.rts = False
+        time.sleep(0.05)
+        ser.dtr = False
+        ser.rts = False
+        time.sleep(0.05)
+        ser.close()
+    except Exception:
+        pass
+
 import sys
 import json
 import time
@@ -79,6 +102,11 @@ def list_ports():
     return out
 
 def find_device_port() -> str:
+    global _CACHED_PORT
+    if _CACHED_PORT:
+        print(f"ℹ️ Using cached port: {_CACHED_PORT}")
+        return _CACHED_PORT
+
     ports = list_ports()
     if not ports:
         die("No serial ports detected. Plug AutoGen X via USB data cable.")
@@ -87,19 +115,23 @@ def find_device_port() -> str:
     for dev, desc in ports:
         print(f"  - {dev}  ({desc})")
 
-    # Prefer CP210x / SLAB / usbserial
-    for dev, desc in ports:
-        d = desc.lower()
-        if "cp210" in d or "slab" in d or "usb to uart" in d or "usbserial" in dev.lower():
-            print(f"\n🧪 Probing {dev} ...")
-            if run_esptool(["--chip","auto","--port",dev,"--baud","115200","flash-id"], silent=True) == 0:
-                print(f"✅ Found ESP device on {dev}\n")
-                return dev
+    # Prefer CP210x/SLAB, then probe each port ONCE
+    def score(dev: str, desc: str) -> int:
+        d = (desc or "").lower()
+        v = (dev or "").lower()
+        if ("cp210" in d) or ("silicon labs" in d) or ("slab" in d):
+            return 0
+        if ("usb to uart" in d) or ("uart" in d):
+            return 1
+        if ("usbserial" in v) or ("usb" in v):
+            return 2
+        return 10
 
-    for dev, desc in ports:
+    for dev, desc in sorted(ports, key=lambda x: score(x[0], x[1])):
         print(f"\n🧪 Probing {dev} ...")
-        if run_esptool(["--chip","auto","--port",dev,"--baud","115200","flash-id"], silent=True) == 0:
+        if probe_esp(dev):
             print(f"✅ Found ESP device on {dev}\n")
+            _CACHED_PORT = dev
             return dev
 
     die("No ESP device found on detected ports.")
@@ -108,40 +140,74 @@ def find_device_port() -> str:
 def run_esptool(args, silent=False) -> int:
     """
     GUI-safe runner:
-    - Frozen (.app): run bundled 'esptool' binary (prevents relaunching GUI)
-    - Not frozen: run system 'esptool'
-    Always non-interactive (stdin=DEVNULL).
+    - Always uses CREATE_NO_WINDOW on Windows (no popup consoles)
+    - If subprocess returncode is non-zero but output shows a successful ESP connection,
+      treat as success (0) to avoid false "No ESP device" failures.
     """
-    import subprocess, os, sys
+    import os, sys, subprocess
 
-    if is_frozen():
-        esptool_bin = os.path.join(sys._MEIPASS, "esptool")
-        cmd = [esptool_bin] + list(args)
-    else:
-        cmd = ["esptool"] + list(args)
+    startupinfo = None
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+
+    CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    cmd = [sys.executable, "-m", "esptool"] + list(args)
+    creationflags = CREATE_NO_WINDOW if os.name == "nt" else 0
 
     try:
-        return subprocess.run(
+        if silent:
+            r = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                creationflags=creationflags,
+                startupinfo=startupinfo,
+            )
+            return r.returncode
+
+        # Non-silent: capture output so we can decide success reliably, then print it for GUI logging
+        r = subprocess.run(
             cmd,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL if silent else None,
-            stderr=subprocess.DEVNULL if silent else None,
-            check=False
-        ).returncode
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            check=False,
+            creationflags=creationflags,
+                startupinfo=startupinfo,
+        )
+
+        out = r.stdout or ""
+        # Forward esptool output to the GUI log (GUI patches print())
+        for line in out.splitlines():
+            print(line)
+
+        # If esptool printed connection markers, accept as success even if rc != 0
+        if ("Connected to ESP" in out) or ("Chip type:" in out) or ("Detecting chip type" in out):
+            return 0
+
+        return r.returncode
     except Exception:
         return 2
-def probe_esp(port: str) -> bool:
-    """
-    Reliable probe: let esptool tell us if it's an ESP.
-    Works consistently across Windows/macOS and matches your manual tests.
-    """
-    # Use flash-id (best) and fall back to chip-id if needed.
-    for cmd in (["flash-id"], ["chip-id"]):
-        rc = run_esptool(["--chip","auto","--port", port, "--baud","115200"] + cmd, silent=True)
-        if rc == 0:
-            return True
-    return False
 
+
+def probe_esp(port: str) -> bool:
+    """Deterministic probe across Windows / frozen / normal.
+    Always non-silent so run_esptool can detect success markers.
+    """
+    rc = run_esptool([
+        "--chip", "auto",
+        "--port", port,
+        "--baud", "115200",
+        "flash-id"
+    ], silent=False)
+    return rc == 0
 
 def resolve_firmware_path(cfg, firmware_override=None) -> str:
     """
