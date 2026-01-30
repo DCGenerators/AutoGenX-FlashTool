@@ -26,7 +26,7 @@ autogen_flash = _import_autogen_flash()
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("AutoGen X Flash Tool (macOS)")
+        self.title("AutoGen X Flash Tool")
         self.geometry("860x560")
         self.minsize(740, 440)
 
@@ -56,7 +56,7 @@ class App(tk.Tk):
 
         self.txt = tk.Text(body, wrap="word")
         self.txt.pack(fill="both", expand=True)
-        self.txt.insert("end", "AutoGen X macOS Flash Tool\n\n")
+        self.txt.insert("end", "AutoGen X Flash Tool\n\n")
         self.txt.insert("end", "1) Click Select Firmware and choose the firmware.bin you received.\n")
         self.txt.insert("end", "2) Plug AutoGen X into USB (data cable)\n")
         self.txt.insert("end", "3) Click Start Flash\n\n")

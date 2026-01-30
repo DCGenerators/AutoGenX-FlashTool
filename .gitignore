@@ -1,35 +1,18 @@
-﻿# ---- Python ----
+﻿# Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
 
-# venv
+# Virtualenv
 .venv/
-venv/
 
-# ---- OS junk ----
-.DS_Store
-Thumbs.db
-
-# ---- PyInstaller ----
-build/
-dist/
+# PyInstaller
+/build/
+/dist/
 *.spec
 
-# ---- Logs / temp ----
+# Logs / temp
 *.log
 *.tmp
 *.bak
-
-# ---- Your one-off patch helpers (keep repo clean) ----
-_patch_*.py
-_inject_*.py
-_consolidated_*.py
-_fix_*.py
-_show_*.py
-_pycompile_*.txt
-
-# ---- Backup copies created during patching ----
-autogen_flash.py*.bak
-autogen_flash_gui.py*.bak

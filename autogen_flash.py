@@ -34,6 +34,13 @@ import sys
 import json
 import time
 
+# --- PyInstaller bundling hint (safe) ---
+try:
+    import esptool  # noqa: F401
+except Exception:
+    esptool = None
+
+
 # -------------------- helpers --------------------
 
 def die(msg: str, code: int = 1):
@@ -138,24 +145,54 @@ def find_device_port() -> str:
 
 # -------------------- esptool (IN-PROCESS) --------------------
 def run_esptool(args, silent=False) -> int:
+    """Run esptool reliably.
+    Frozen Windows EXE:
+      - MUST run in-process (subprocess sys.executable relaunches the EXE -> popups/recursion)
+    Normal python:
+      - Run via sys.executable -m esptool
+    Returns:
+      0 on success, non-zero on failure, 2 on unexpected exception.
     """
-    GUI-safe runner:
-    - Always uses CREATE_NO_WINDOW on Windows (no popup consoles)
-    - If subprocess returncode is non-zero but output shows a successful ESP connection,
-      treat as success (0) to avoid false "No ESP device" failures.
-    """
-    import os, sys, subprocess
+    import os, sys
 
-    startupinfo = None
-    if os.name == "nt":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
+    frozen = bool(getattr(sys, 'frozen', False)) or hasattr(sys, '_MEIPASS')
 
-    CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    # --- Frozen Windows: run esptool.main() in-process ---
+    if frozen and os.name == 'nt':
+        try:
+            import io, contextlib
+            import esptool
+            buf = io.StringIO()
+            if silent:
+                with open(os.devnull, 'w') as dn:
+                    with contextlib.redirect_stdout(dn), contextlib.redirect_stderr(dn):
+                        try:
+                            esptool.main(list(args))
+                            return 0
+                        except SystemExit as ex:
+                            return int(ex.code) if isinstance(ex.code, int) else 1
+            else:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    try:
+                        esptool.main(list(args))
+                        rc = 0
+                    except SystemExit as ex:
+                        rc = int(ex.code) if isinstance(ex.code, int) else 1
+                out = buf.getvalue() or ''
+                for line in out.splitlines():
+                    print(line)
+                # marker override
+                if ('Connected to ESP' in out) or ('Chip type:' in out) or ('Detecting chip type' in out):
+                    return 0
+                return rc
+        except Exception as ex:
+               return 2
 
-    cmd = [sys.executable, "-m", "esptool"] + list(args)
-    creationflags = CREATE_NO_WINDOW if os.name == "nt" else 0
+    # --- Normal python: subprocess python -m esptool ---
+    import subprocess
+    CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    cmd = [sys.executable, '-m', 'esptool'] + list(args)
+    creationflags = CREATE_NO_WINDOW if os.name == 'nt' else 0
 
     try:
         if silent:
@@ -166,47 +203,31 @@ def run_esptool(args, silent=False) -> int:
                 stderr=subprocess.DEVNULL,
                 check=False,
                 creationflags=creationflags,
-                startupinfo=startupinfo,
             )
             return r.returncode
 
-        # Non-silent: capture output so we can decide success reliably, then print it for GUI logging
         r = subprocess.run(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            errors="replace",
+            errors='replace',
             check=False,
             creationflags=creationflags,
-                startupinfo=startupinfo,
         )
-
-        out = r.stdout or ""
-        # Forward esptool output to the GUI log (GUI patches print())
+        out = r.stdout or ''
         for line in out.splitlines():
             print(line)
-
-        # If esptool printed connection markers, accept as success even if rc != 0
-        if ("Connected to ESP" in out) or ("Chip type:" in out) or ("Detecting chip type" in out):
+        if ('Connected to ESP' in out) or ('Chip type:' in out) or ('Detecting chip type' in out):
             return 0
-
         return r.returncode
-    except Exception:
+    except Exception as ex:
         return 2
 
-
 def probe_esp(port: str) -> bool:
-    """Deterministic probe across Windows / frozen / normal.
-    Always non-silent so run_esptool can detect success markers.
-    """
-    rc = run_esptool([
-        "--chip", "auto",
-        "--port", port,
-        "--baud", "115200",
-        "flash-id"
-    ], silent=False)
+    """Probe using non-silent run so marker detection applies everywhere."""
+    rc = run_esptool(['--chip','auto','--port', port, '--baud','115200','flash-id'], silent=False)
     return rc == 0
 
 def resolve_firmware_path(cfg, firmware_override=None) -> str:
